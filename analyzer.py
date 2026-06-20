@@ -1,10 +1,16 @@
 import os
 import json
-from openai import OpenAI
+import asyncio
+import aiohttp
+from openai import AsyncOpenAI
 from config import WATCH_STOCKS, OPENAI_MODEL
-from crawler import fetch_news
+from crawler import fetch_news_async
 
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+# 동시 실행 제한 (네이버 API / OpenAI API rate limit 대응)
+NAVER_SEMAPHORE  = asyncio.Semaphore(5)   # 종목 동시 크롤링 5개
+OPENAI_SEMAPHORE = asyncio.Semaphore(20)  # OpenAI 동시 호출 20개
 
 CLASSIFY_SYSTEM = """당신은 주식 뉴스 감정 분석 전문가입니다.
 뉴스 제목과 요약을 보고 해당 종목에 미치는 실질적인 투자 영향을 판단하세요.
@@ -30,28 +36,28 @@ CLASSIFY_USER = """종목명: {stock_name}
 LABEL_SCORE = {"긍정": 1.0, "중립": 0.0, "부정": -1.0}
 
 
-def _classify_article(stock_name: str, title: str, description: str) -> dict:
-    """뉴스 1개를 긍정/중립/부정으로 분류."""
-    prompt = CLASSIFY_USER.format(
-        stock_name=stock_name,
-        title=title,
-        description=description,
-    )
-    response = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": CLASSIFY_SYSTEM},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0,
-        response_format={"type": "json_object"},
-    )
+async def _classify_article(stock_name: str, title: str, description: str) -> dict:
+    """뉴스 1개를 비동기로 긍정/중립/부정 분류."""
+    prompt = CLASSIFY_USER.format(stock_name=stock_name, title=title, description=description)
+
+    async with OPENAI_SEMAPHORE:
+        response = await client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": CLASSIFY_SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+
     result = json.loads(response.choices[0].message.content)
     label = result.get("label", "중립")
     return {
         "label": label,
         "score": LABEL_SCORE.get(label, 0.0),
         "reason": result.get("reason", ""),
+        "title": title,
     }
 
 
@@ -62,7 +68,6 @@ def _aggregate(classified: list[dict]) -> dict:
 
     scores = [c["score"] for c in classified]
     avg = sum(scores) / len(scores)
-
     pos = sum(1 for c in classified if c["label"] == "긍정")
     neu = sum(1 for c in classified if c["label"] == "중립")
     neg = sum(1 for c in classified if c["label"] == "부정")
@@ -77,53 +82,61 @@ def _aggregate(classified: list[dict]) -> dict:
     return {"score": round(avg, 2), "sentiment": sentiment, "pos": pos, "neu": neu, "neg": neg}
 
 
-def run_analysis() -> dict:
-    """전체 감시 종목 감정 분석 실행 후 긍정/부정 Top 10 반환."""
-    results = []
+async def _analyze_stock(session: aiohttp.ClientSession, stock: dict) -> dict | None:
+    """종목 1개: 뉴스 수집 → 전체 뉴스 병렬 분류 → 집계."""
+    async with NAVER_SEMAPHORE:
+        news_list = await fetch_news_async(session, stock["name"], stock.get("aliases", []))
 
-    for stock in WATCH_STOCKS:
-        try:
-            news_list = fetch_news(stock["name"], stock.get("aliases", []))
-            if not news_list:
-                print(f"  뉴스 없음 (제외): {stock['name']}")
-                continue
+    if not news_list:
+        print(f"  뉴스 없음 (제외): {stock['name']}")
+        return None
 
-            classified = []
-            for news in news_list:
-                try:
-                    c = _classify_article(stock["name"], news["title"], news["description"])
-                    classified.append({**c, "title": news["title"]})
-                except Exception as e:
-                    print(f"    분류 실패: {news['title'][:30]}... - {e}")
+    # 해당 종목의 모든 뉴스를 동시에 분류
+    tasks = [
+        _classify_article(stock["name"], n["title"], n["description"])
+        for n in news_list
+    ]
+    classified_raw = await asyncio.gather(*tasks, return_exceptions=True)
 
-            if not classified:
-                continue
+    classified = [c for c in classified_raw if isinstance(c, dict)]
+    if not classified:
+        return None
 
-            agg = _aggregate(classified)
-            results.append({
-                "name": stock["name"],
-                "ticker": stock["ticker"],
-                "score": agg["score"],
-                "sentiment": agg["sentiment"],
-                "pos": agg["pos"],
-                "neu": agg["neu"],
-                "neg": agg["neg"],
-                "news_count": len(classified),
-                "news": [
-                    {"title": c["title"], "label": c["label"], "reason": c["reason"]}
-                    for c in classified
-                ],
-            })
-            print(
-                f"  완료: {stock['name']:12s} ({agg['score']:+.2f}) "
-                f"긍정{agg['pos']} 중립{agg['neu']} 부정{agg['neg']} / {len(classified)}건"
-            )
-        except Exception as e:
-            print(f"  실패: {stock['name']} - {e}")
+    agg = _aggregate(classified)
+    print(
+        f"  완료: {stock['name']:14s} ({agg['score']:+.2f}) "
+        f"긍정{agg['pos']} 중립{agg['neu']} 부정{agg['neg']} / {len(classified)}건"
+    )
+    return {
+        "name": stock["name"],
+        "ticker": stock["ticker"],
+        "score": agg["score"],
+        "sentiment": agg["sentiment"],
+        "pos": agg["pos"],
+        "neu": agg["neu"],
+        "neg": agg["neg"],
+        "news_count": len(classified),
+        "news": [
+            {"title": c["title"], "label": c["label"], "reason": c["reason"]}
+            for c in classified
+        ],
+    }
 
+
+async def _run_analysis_async() -> dict:
+    async with aiohttp.ClientSession() as session:
+        tasks = [_analyze_stock(session, stock) for stock in WATCH_STOCKS]
+        raw = await asyncio.gather(*tasks, return_exceptions=True)
+
+    results = [r for r in raw if isinstance(r, dict)]
     results.sort(key=lambda x: x["score"], reverse=True)
 
     return {
         "positive_top10": results[:10],
         "negative_top10": results[-10:][::-1],
     }
+
+
+def run_analysis() -> dict:
+    """전체 감시 종목 비동기 감정 분석 실행 후 긍정/부정 Top 10 반환."""
+    return asyncio.run(_run_analysis_async())
