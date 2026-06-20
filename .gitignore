@@ -1,0 +1,34 @@
+# 환경변수 (절대 커밋 금지)
+.env
+
+# 전날 Top 10 저장 데이터
+data/
+*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# 가상환경
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# 로그
+*.log
+logs/

@@ -1,0 +1,85 @@
+name: Stock Sentiment Bot
+
+on:
+  schedule:
+    # 오후 9시 KST = UTC 12:00
+    - cron: "0 12 * * 1-5"
+    # 오후 3시 10분 KST = UTC 06:10
+    - cron: "10 6 * * 2-6"
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "실행할 작업 (sentiment / price)"
+        required: true
+        default: "sentiment"
+        type: choice
+        options:
+          - sentiment
+          - price
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 패키지 설치
+        run: pip install -r requirements.txt
+
+      - name: 감정 분석 리포트 실행 (21:00 KST)
+        if: github.event_name == 'schedule' && github.event.schedule == '0 12 * * 1-5'
+        env:
+          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python main.py sentiment
+
+      - name: 주가 변화율 리포트 실행 (15:10 KST)
+        if: github.event_name == 'schedule' && github.event.schedule == '10 6 * * 2-6'
+        env:
+          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python main.py price
+
+      - name: 수동 실행
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python main.py ${{ github.event.inputs.job }}
+
+      - name: Top 10 데이터 저장 (감정 분석 후)
+        if: >
+          (github.event_name == 'schedule' && github.event.schedule == '0 12 * * 1-5') ||
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.job == 'sentiment')
+        uses: actions/upload-artifact@v4
+        with:
+          name: top10-data
+          path: data/top10.json
+          retention-days: 2
+
+      - name: Top 10 데이터 복원 (주가 조회 전)
+        if: >
+          (github.event_name == 'schedule' && github.event.schedule == '10 6 * * 2-6') ||
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.job == 'price')
+        uses: actions/download-artifact@v4
+        with:
+          name: top10-data
+          path: data/
+        continue-on-error: true
